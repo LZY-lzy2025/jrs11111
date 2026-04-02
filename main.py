@@ -201,9 +201,9 @@ def generate_playlist():
                     match_time_str = f"{current_year}-{match_time_raw}"
                     match_dt = tz.localize(datetime.datetime.strptime(match_time_str, "%Y-%m-%d %H:%M"))
                     
-                    # 抓取逻辑保持不变：前 4.5 小时，后 1 小时
+                    # 抓取窗口：前 1 小时，后 30 分钟
                     time_diff_hours = (match_dt - now).total_seconds() / 3600
-                    if not (-4.5 <= time_diff_hours <= 1):
+                    if not (-1 <= time_diff_hours <= 0.5):
                         continue
                     
                     league_tag = match.find('li', class_='lab_events')
@@ -361,8 +361,8 @@ def debug_url():
     return jsonify(debug_info)
 
 def run_scheduler():
-    # 每 14 分钟运行一次
-    schedule.every(14).minutes.do(generate_playlist)
+    # 每 8 分钟运行一次
+    schedule.every(8).minutes.do(generate_playlist)
     while True:
         schedule.run_pending()
         time.sleep(30)
