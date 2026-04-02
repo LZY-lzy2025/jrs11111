@@ -318,6 +318,10 @@ def generate_playlist():
 def index():
     return "Service OK", 200
 
+@app.route('/healthz')
+def healthz():
+    return jsonify({"status": "ok"}), 200
+
 @app.route('/m3u')
 def get_m3u():
     try: return send_file(OUTPUT_M3U_FILE, mimetype='application/vnd.apple.mpegurl', as_attachment=False)
@@ -382,6 +386,7 @@ if __name__ == "__main__":
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
     
-    # 兼容容器平台分配端口（如 Render/Railway/Fly.io）
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    # Sealos 默认部署端口按 5000 处理，同时兼容平台注入 PORT
+    port = int(os.getenv("PORT", "5000"))
+    print(f"Starting Flask server on 0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, threaded=True)
