@@ -18,6 +18,7 @@ SOURCE_URL = "https://im-imgs-bucket.oss-accelerate.aliyuncs.com/index.js?t_5"
 BASE_URL = "http://play.sportsteam368.com"
 OUTPUT_M3U_FILE = "/app/output/playlist.m3u"
 OUTPUT_TXT_FILE = "/app/output/playlist.txt"
+MIDNIGHT_CLEANUP_STAMP_FILE = "/app/output/last_midnight_cleanup_date.txt"
 TARGET_KEY = "ABCDEFGHIJKLMNOPQRSTUVWX"
 # ------------------
 
@@ -148,6 +149,65 @@ def load_existing_entries_from_m3u():
         i += 1
     return entries
 
+def _parse_match_datetime_from_channel_name(channel_name, current_year, tz):
+    if not channel_name:
+        return None
+    # 频道名通常以 "MM-DD HH:MM " 开头，如 "04-01 23:30 A VS B - 高清"
+    match = re.match(r'^(\d{2}-\d{2} \d{2}:\d{2})', channel_name)
+    if not match:
+        return None
+
+    month_day_time = match.group(1)
+    try:
+        match_dt = tz.localize(datetime.datetime.strptime(f"{current_year}-{month_day_time}", "%Y-%m-%d %H:%M"))
+    except ValueError:
+        return None
+
+    # 处理跨年边界：如果解析结果比当前时间晚很多，说明是上一年
+    if (match_dt - datetime.datetime.now(tz)).days > 180:
+        try:
+            match_dt = tz.localize(datetime.datetime.strptime(f"{current_year - 1}-{month_day_time}", "%Y-%m-%d %H:%M"))
+        except ValueError:
+            return None
+    return match_dt
+
+def should_run_midnight_cleanup(today_date):
+    try:
+        if not os.path.exists(MIDNIGHT_CLEANUP_STAMP_FILE):
+            return True
+        with open(MIDNIGHT_CLEANUP_STAMP_FILE, "r", encoding="utf-8") as f:
+            last_cleaned = f.read().strip()
+        return last_cleaned != today_date.isoformat()
+    except Exception:
+        return True
+
+def mark_midnight_cleanup_done(today_date):
+    try:
+        os.makedirs(os.path.dirname(MIDNIGHT_CLEANUP_STAMP_FILE), exist_ok=True)
+        with open(MIDNIGHT_CLEANUP_STAMP_FILE, "w", encoding="utf-8") as f:
+            f.write(today_date.isoformat())
+    except Exception:
+        pass
+
+def cleanup_existing_entries_for_today(existing_entries, now, tz):
+    # 删除“前一天 20:00 之前”的比赛；保留“前一天 20:00-24:00”和“今天”的比赛
+    yesterday = (now - datetime.timedelta(days=1)).date()
+    cutoff_dt = tz.localize(datetime.datetime.combine(yesterday, datetime.time(hour=20, minute=0)))
+    current_year = now.year
+
+    kept_entries = []
+    removed_count = 0
+    for item in existing_entries:
+        match_dt = _parse_match_datetime_from_channel_name(item.get("channel_name"), current_year, tz)
+        if match_dt and match_dt < cutoff_dt:
+            removed_count += 1
+            continue
+        kept_entries.append(item)
+
+    if removed_count > 0:
+        print(f"Midnight cleanup: removed {removed_count} outdated lines before {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')}.")
+    return kept_entries
+
 # ==========================================
 # 静默版爬虫主流程
 # ==========================================
@@ -170,6 +230,12 @@ def generate_playlist():
 
     current_year = now.year
     existing_entries = load_existing_entries_from_m3u()
+
+    # 每天第一次抓取先做一次清理：删除前一天 20:00 之前的旧比赛
+    if should_run_midnight_cleanup(now.date()):
+        existing_entries = cleanup_existing_entries_for_today(existing_entries, now, tz)
+        mark_midnight_cleanup_done(now.date())
+
     existing_channel_names = {item["channel_name"] for item in existing_entries}
 
     m3u_lines = ["#EXTM3U\n"]
