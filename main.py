@@ -173,23 +173,40 @@ def _parse_match_datetime_from_channel_name(channel_name, current_year, tz):
 
 def load_refreshed_channels():
     if not os.path.exists(REFRESHED_CHANNELS_FILE):
-        return set()
+        return {}
     try:
         with open(REFRESHED_CHANNELS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if isinstance(k, str)}
         if isinstance(data, list):
-            return set([item for item in data if isinstance(item, str)])
+            # 兼容旧格式：["channel_a", "channel_b"]
+            return {item: None for item in data if isinstance(item, str)}
     except Exception:
         pass
-    return set()
+    return {}
 
 def save_refreshed_channels(refreshed_channels):
     try:
         os.makedirs(os.path.dirname(REFRESHED_CHANNELS_FILE), exist_ok=True)
         with open(REFRESHED_CHANNELS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(list(refreshed_channels)), f, ensure_ascii=False)
+            json.dump(refreshed_channels, f, ensure_ascii=False)
     except Exception:
         pass
+
+def cleanup_refreshed_channels(refreshed_channels, now, tz, window_hours=5):
+    # 清理 JSON 中超出时间窗口的重抓记录，避免无限增长
+    if not refreshed_channels:
+        return {}
+    current_year = now.year
+    window_seconds = window_hours * 3600
+    cleaned = {}
+    for channel_name, refreshed_at in refreshed_channels.items():
+        match_dt = _parse_match_datetime_from_channel_name(channel_name, current_year, tz)
+        if match_dt and abs((match_dt - now).total_seconds()) > window_seconds:
+            continue
+        cleaned[channel_name] = refreshed_at
+    return cleaned
 
 def keep_entries_within_time_window(existing_entries, now, tz, window_hours=5):
     # 仅保留“当前时间前后 5 小时”的比赛源
@@ -231,7 +248,7 @@ def generate_playlist():
 
     current_year = now.year
     existing_entries = keep_entries_within_time_window(load_existing_entries_from_m3u(), now, tz, window_hours=5)
-    refreshed_channels = load_refreshed_channels()
+    refreshed_channels = cleanup_refreshed_channels(load_refreshed_channels(), now, tz, window_hours=5)
 
     existing_entries_dict = {item["channel_name"]: item for item in existing_entries}
     existing_channel_names = set(existing_entries_dict.keys())
@@ -328,7 +345,7 @@ def generate_playlist():
                                     }
                                     existing_channel_names.add(specific_channel_name)
                                     if specific_channel_name in refresh_candidates:
-                                        refreshed_channels.add(specific_channel_name)
+                                        refreshed_channels[specific_channel_name] = now.isoformat()
                                     
                                     success_count += 1
                         except Exception:
