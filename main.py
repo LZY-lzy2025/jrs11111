@@ -18,7 +18,7 @@ SOURCE_URL = "https://im-imgs-bucket.oss-accelerate.aliyuncs.com/index.js?t_5"
 BASE_URL = "http://play.sportsteam368.com"
 OUTPUT_M3U_FILE = "/app/output/playlist.m3u"
 OUTPUT_TXT_FILE = "/app/output/playlist.txt"
-MIDNIGHT_CLEANUP_STAMP_FILE = "/app/output/last_midnight_cleanup_date.txt"
+REFRESHED_CHANNELS_FILE = "/app/output/refetched_channels.json"
 TARGET_KEY = "ABCDEFGHIJKLMNOPQRSTUVWX"
 # ------------------
 
@@ -171,41 +171,42 @@ def _parse_match_datetime_from_channel_name(channel_name, current_year, tz):
             return None
     return match_dt
 
-def should_run_midnight_cleanup(today_date):
+def load_refreshed_channels():
+    if not os.path.exists(REFRESHED_CHANNELS_FILE):
+        return set()
     try:
-        if not os.path.exists(MIDNIGHT_CLEANUP_STAMP_FILE):
-            return True
-        with open(MIDNIGHT_CLEANUP_STAMP_FILE, "r", encoding="utf-8") as f:
-            last_cleaned = f.read().strip()
-        return last_cleaned != today_date.isoformat()
+        with open(REFRESHED_CHANNELS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return set([item for item in data if isinstance(item, str)])
     except Exception:
-        return True
+        pass
+    return set()
 
-def mark_midnight_cleanup_done(today_date):
+def save_refreshed_channels(refreshed_channels):
     try:
-        os.makedirs(os.path.dirname(MIDNIGHT_CLEANUP_STAMP_FILE), exist_ok=True)
-        with open(MIDNIGHT_CLEANUP_STAMP_FILE, "w", encoding="utf-8") as f:
-            f.write(today_date.isoformat())
+        os.makedirs(os.path.dirname(REFRESHED_CHANNELS_FILE), exist_ok=True)
+        with open(REFRESHED_CHANNELS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(refreshed_channels)), f, ensure_ascii=False)
     except Exception:
         pass
 
-def cleanup_existing_entries_for_today(existing_entries, now, tz):
-    # 删除“前一天 20:00 之前”的比赛；保留“前一天 20:00-24:00”和“今天”的比赛
-    yesterday = (now - datetime.timedelta(days=1)).date()
-    cutoff_dt = tz.localize(datetime.datetime.combine(yesterday, datetime.time(hour=20, minute=0)))
+def keep_entries_within_time_window(existing_entries, now, tz, window_hours=5):
+    # 仅保留“当前时间前后 5 小时”的比赛源
     current_year = now.year
+    window_seconds = window_hours * 3600
 
     kept_entries = []
     removed_count = 0
     for item in existing_entries:
         match_dt = _parse_match_datetime_from_channel_name(item.get("channel_name"), current_year, tz)
-        if match_dt and match_dt < cutoff_dt:
+        if match_dt and abs((match_dt - now).total_seconds()) > window_seconds:
             removed_count += 1
             continue
         kept_entries.append(item)
 
     if removed_count > 0:
-        print(f"Midnight cleanup: removed {removed_count} outdated lines before {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')}.")
+        print(f"Window cleanup: removed {removed_count} lines outside ±{window_hours} hours.")
     return kept_entries
 
 # ==========================================
@@ -229,26 +230,19 @@ def generate_playlist():
         return
 
     current_year = now.year
-    existing_entries = load_existing_entries_from_m3u()
+    existing_entries = keep_entries_within_time_window(load_existing_entries_from_m3u(), now, tz, window_hours=5)
+    refreshed_channels = load_refreshed_channels()
 
-    # 每天第一次抓取先做一次清理：删除前一天 20:00 之前的旧比赛
-    if should_run_midnight_cleanup(now.date()):
-        existing_entries = cleanup_existing_entries_for_today(existing_entries, now, tz)
-        mark_midnight_cleanup_done(now.date())
+    existing_entries_dict = {item["channel_name"]: item for item in existing_entries}
+    existing_channel_names = set(existing_entries_dict.keys())
 
-    existing_channel_names = {item["channel_name"] for item in existing_entries}
-
-    m3u_lines = ["#EXTM3U\n"]
-    txt_dict = {}
-    for item in existing_entries:
-        group_name = item["group_name"]
-        specific_channel_name = item["channel_name"]
-        real_stream_url = item["stream_url"]
-        m3u_lines.append(f'#EXTINF:-1 tvg-name="{specific_channel_name}" group-title="{group_name}",{specific_channel_name}\n')
-        m3u_lines.append(f"{real_stream_url}\n")
-        if group_name not in txt_dict:
-            txt_dict[group_name] = []
-        txt_dict[group_name].append(f"{specific_channel_name},{real_stream_url}")
+    refresh_candidates = set()
+    for channel_name in existing_channel_names:
+        match_dt = _parse_match_datetime_from_channel_name(channel_name, current_year, tz)
+        if not match_dt:
+            continue
+        if (now - match_dt).total_seconds() >= 1.5 * 3600 and channel_name not in refreshed_channels:
+            refresh_candidates.add(channel_name)
 
     success_count = 0
     skip_count = 0
@@ -267,9 +261,9 @@ def generate_playlist():
                     match_time_str = f"{current_year}-{match_time_raw}"
                     match_dt = tz.localize(datetime.datetime.strptime(match_time_str, "%Y-%m-%d %H:%M"))
                     
-                    # 抓取窗口：前 1 小时，后 30 分钟
+                    # 抓取窗口：开赛前 2 小时到开赛后 30 分钟
                     time_diff_hours = (match_dt - now).total_seconds() / 3600
-                    if not (-1 <= time_diff_hours <= 0.5):
+                    if not (-2 <= time_diff_hours <= 0.5):
                         continue
                     
                     league_tag = match.find('li', class_='lab_events')
@@ -314,8 +308,9 @@ def generate_playlist():
                         final_url = urllib.parse.urljoin(target_link, line_info['path'])
                         specific_channel_name = f"{base_channel_name} - {line_info['name']}"
                         if specific_channel_name in existing_channel_names:
-                            skip_count += 1
-                            continue
+                            if specific_channel_name not in refresh_candidates:
+                                skip_count += 1
+                                continue
                         
                         try:
                             page.goto(final_url, wait_until="load", timeout=15000)
@@ -326,18 +321,14 @@ def generate_playlist():
                             if encrypted_id:
                                 real_stream_url = decrypt_id_to_url(encrypted_id)
                                 if real_stream_url:
-                                    m3u_lines.append(f'#EXTINF:-1 tvg-name="{specific_channel_name}" group-title="{group_name}",{specific_channel_name}\n')
-                                    m3u_lines.append(f'{real_stream_url}\n')
-                                    
-                                    if group_name not in txt_dict: txt_dict[group_name] = []
-                                    txt_dict[group_name].append(f"{specific_channel_name},{real_stream_url}")
-
-                                    existing_channel_names.add(specific_channel_name)
-                                    existing_entries.append({
+                                    existing_entries_dict[specific_channel_name] = {
                                         "group_name": group_name,
                                         "channel_name": specific_channel_name,
                                         "stream_url": real_stream_url,
-                                    })
+                                    }
+                                    existing_channel_names.add(specific_channel_name)
+                                    if specific_channel_name in refresh_candidates:
+                                        refreshed_channels.add(specific_channel_name)
                                     
                                     success_count += 1
                         except Exception:
@@ -354,7 +345,20 @@ def generate_playlist():
     # 核心机制：原子写入防冲突
     # ==========================================
     os.makedirs(os.path.dirname(OUTPUT_M3U_FILE), exist_ok=True)
-    if len(existing_entries) == 0:
+    final_entries = list(existing_entries_dict.values())
+    m3u_lines = ["#EXTM3U\n"]
+    txt_dict = {}
+    for item in final_entries:
+        group_name = item["group_name"]
+        specific_channel_name = item["channel_name"]
+        real_stream_url = item["stream_url"]
+        m3u_lines.append(f'#EXTINF:-1 tvg-name="{specific_channel_name}" group-title="{group_name}",{specific_channel_name}\n')
+        m3u_lines.append(f"{real_stream_url}\n")
+        if group_name not in txt_dict:
+            txt_dict[group_name] = []
+        txt_dict[group_name].append(f"{specific_channel_name},{real_stream_url}")
+
+    if len(final_entries) == 0:
         m3u_lines.append("# 当前时间段无可用直播\n")
         txt_dict["System"] = ["No streams,http://127.0.0.1/error.mp4"]
 
@@ -372,9 +376,10 @@ def generate_playlist():
     # 2. 瞬间替换掉旧文件，确保播放器读取零卡顿、无空白期
     os.replace(tmp_m3u, OUTPUT_M3U_FILE)
     os.replace(tmp_txt, OUTPUT_TXT_FILE)
+    save_refreshed_channels(refreshed_channels)
     
     finish_time = datetime.datetime.now(tz)
-    print(f"[{finish_time.strftime('%Y-%m-%d %H:%M:%S')}] Task finished. New {success_count} lines, skipped {skip_count} existing lines, total {len(existing_entries)} lines.")
+    print(f"[{finish_time.strftime('%Y-%m-%d %H:%M:%S')}] Task finished. New {success_count} lines, skipped {skip_count} existing lines, total {len(final_entries)} lines.")
 
 
 # ==========================================
