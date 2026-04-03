@@ -433,7 +433,7 @@ def debug_url():
 
 def run_scheduler():
     # 每 8 分钟运行一次
-    schedule.every(10).minutes.do(generate_playlist)
+    schedule.every(14).minutes.do(generate_playlist)
     while True:
         schedule.run_pending()
         time.sleep(30)
